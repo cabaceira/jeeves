@@ -40,9 +40,7 @@ jeeves/
 Jeeves reads configuration from environment variables, with sensible defaults:
 
 | Variable                | Description                          | Default      |
-| ----------------------- | ------------------------------------ | ------------ |
-| `AWS_ACCESS_KEY_ID`     | AWS access key                       | N/A          |
-| `AWS_SECRET_ACCESS_KEY` | AWS secret access key                | N/A          |
+| ----------------------- | ------------------------------------ | ------------ |       |
 | `AWS_DEFAULT_REGION`    | AWS region                           | `us-east-1`  |
 | `DEFAULT_OS_VERSION`    | Ubuntu version for EC2 instances     | `24.04`      |
 | `DEFAULT_INSTANCE_TYPE` | EC2 instance type                    | `t2.xlarge`  |
@@ -88,4 +86,4 @@ The `scripts/` directory contains bash scripts for in-instance bootstrapping. Th
 5. **Parameterization**: Allow customizing instance counts, sizes, and other parameters at runtime via CLI flags or config file.
 6. **Testing & CI**: Add unit tests for pipelines, integration tests against AWS, and CI/CD workflows.
 
-This document serves as a high-level overview of the current state and architectural design of Jeeves. From here, we can dive into specific areas for development or refinement.
+
