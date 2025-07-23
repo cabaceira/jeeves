@@ -84,7 +84,7 @@ Each pipeline subclasses `Pipeline` and implements `run()`—the ordered steps f
 
 ### 3. Tear-down Pipelines
 
-- **`destroy_basic_docker.py`**  
+- **`destroy_rc_mongo_docker.py`**  
   - Terminates instances tagged `jeeves-mongo` & `jeeves-rocketchat`.  
   - Deletes the `jeeves-basic` security group.
 
@@ -93,10 +93,6 @@ Each pipeline subclasses `Pipeline` and implements `run()`—the ordered steps f
   - Runs `terraform destroy`.  
   - Terminates controller & worker instances.  
   - Cleans up security groups with ENI-detachment retries and rule revocations.
-
-- **`destroy_rc_mongo_docker.py`**  
-  - Terminates MongoDB-only EC2 instance (for legacy Docker pipeline).  
-  - Deletes the associated `jeeves-mongo` security group.
 
 All destroy scripts are **idempotent**: they check for resource existence, ignore “not found” errors, and retry or skip gracefully.
 
@@ -121,9 +117,6 @@ err()   { echo "[ERROR]" "$@" >&2; exit 1; }
   * Installs MongoDB, configures a single-node replica set, and sets up admin credentials.
 * **`rocketchat_bootstrap.sh`**
 
-  * Installs Docker, pulls Rocket.Chat images, and runs `docker-compose up -d`.
-* **`microk8s_controller_bootstrap.sh` / `microk8s_worker_bootstrap.sh`**
-
   * Installs MicroK8s, joins worker to controller, enables DNS, storage, dashboard, etc.
 * **`deploy_rocketchat_helm.sh`**
 
@@ -144,7 +137,8 @@ err()   { echo "[ERROR]" "$@" >&2; exit 1; }
    * Support Multi-AZ controllers behind an NLB, add worker autoscaling groups.
 4. **Observability**
 
-   * Integrate CloudWatch Logs, Prometheus metrics (Traefik & K8s), and alerting.
+   * Integrate Prometheus/Graphana Rocket.Chat metrics, CloudWatch Logs, default Prometheus metrics (Traefik & K8s), and alerting.
+   * 
 5. **Automated Testing**
 
    * Write unit tests for pipelines, stub AWS calls with `moto`, add end-to-end integration tests.
