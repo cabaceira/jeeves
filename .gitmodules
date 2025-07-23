@@ -1,0 +1,3 @@
+[submodule "ps-auto-infra"]
+	path = ps-auto-infra
+	url = ./ps-auto-infra

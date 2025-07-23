@@ -1,0 +1,368 @@
+################################################################################
+# 1. Install CRDs + upstream RBAC (idempotent)
+################################################################################
+locals {
+  crd_files = [
+    "https://raw.githubusercontent.com/traefik/traefik/v3.3/docs/content/reference/dynamic-configuration/kubernetes-crd-definition-v1.yml",
+    "https://raw.githubusercontent.com/traefik/traefik/v3.3/docs/content/reference/dynamic-configuration/kubernetes-crd-rbac.yml",
+  ]
+}
+
+resource "null_resource" "install_crds" {
+  triggers = { always = timestamp() }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      for url in ${join(" ", local.crd_files)}; do
+        echo "⏳ Applying CRDs from $url"
+        kubectl --kubeconfig="${path.root}/microk8s.config" \
+          apply --validate=false --request-timeout=120s -f "$url" \
+        || echo "⚠️ Warning: CRD apply failed for $url (already applied?), continuing…"
+      done
+    EOT
+  }
+}
+
+resource "null_resource" "wait_for_api" {
+  depends_on = [ null_resource.install_crds ]
+
+  provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
+    command = <<-EOT
+      for i in $(seq 1 20); do
+        if kubectl --kubeconfig="${path.root}/microk8s.config" get --raw="/healthz" 2>/dev/null | grep -q ok; then
+          echo "✅ kube-apiserver healthy"
+          exit 0
+        fi
+        echo "⏳ Waiting for kube-apiserver… ($i/20)"
+        sleep 5
+      done
+      echo "❌ kube-apiserver never became healthy"
+      exit 1
+    EOT
+  }
+}
+
+################################################################################
+# 2. ServiceAccount & RBAC
+################################################################################
+resource "kubernetes_service_account" "traefik_sa" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata {
+    name      = "traefik-ingress-controller"
+    namespace = "kube-system"
+  }
+}
+
+resource "kubernetes_cluster_role" "traefik_core" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata { name = "traefik-core-access" }
+  rule {
+    api_groups = [""]
+    resources  = ["services","endpoints","secrets","namespaces","nodes"]
+    verbs      = ["get","list","watch"]
+  }
+  rule {
+    api_groups = ["discovery.k8s.io"]
+    resources  = ["endpointslices"]
+    verbs      = ["get","list","watch"]
+  }
+  rule {
+    api_groups = ["networking.k8s.io"]
+    resources  = ["ingresses","ingressclasses"]
+    verbs      = ["get","list","watch"]
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "traefik_sa_to_upstream_role" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata { name = "traefik-ingress-controller-kubesystem" }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = "traefik-ingress-controller"
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.traefik_sa.metadata[0].name
+    namespace = "kube-system"
+  }
+}
+
+resource "kubernetes_cluster_role_binding" "traefik_sa_to_core_role" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata { name = "traefik-core-access-binding" }
+  role_ref {
+    api_group = "rbac.authorization.k8s.io"
+    kind      = "ClusterRole"
+    name      = kubernetes_cluster_role.traefik_core.metadata[0].name
+  }
+  subject {
+    kind      = "ServiceAccount"
+    name      = kubernetes_service_account.traefik_sa.metadata[0].name
+    namespace = "kube-system"
+  }
+}
+
+################################################################################
+# 3. ConfigMap — entryPoints + ACME (no built-in redirect)
+################################################################################
+resource "kubernetes_config_map" "traefik_cfg" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata {
+    name      = "traefik-config"
+    namespace = "kube-system"
+  }
+  data = {
+    "traefik.yaml" = <<-YAML
+      api:
+        dashboard: true
+      entryPoints:
+        web:
+          address: ":80"
+        websecure:
+          address: ":443"
+      providers:
+        kubernetesCRD: {}
+        kubernetesIngress:
+          allowExternalNameServices: true
+      certificatesResolvers:
+        letsencrypt:
+          acme:
+            email: "${var.acme_email}"
+            storage: "/letsencrypt/acme.json"
+            httpChallenge:
+              entryPoint: web
+      ping: {}
+    YAML
+  }
+}
+
+################################################################################
+# 3a. Middleware — redirect-to-https
+################################################################################
+resource "local_file" "redirect_to_https_yaml" {
+  filename = "${path.module}/redirect-to-https.yaml"
+  content  = <<-YAML
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-to-https
+  namespace: psautoinfra
+spec:
+  redirectScheme:
+    scheme: https
+YAML
+}
+
+resource "null_resource" "apply_redirect_to_https" {
+  depends_on = [ null_resource.wait_for_api ]
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=\"${path.root}/microk8s.config\" apply -f ${local_file.redirect_to_https_yaml.filename}"
+  }
+  triggers = { always = timestamp() }
+}
+
+################################################################################
+# 4. hostPath PV / PVC for ACME storage
+################################################################################
+resource "kubernetes_persistent_volume" "traefik_pv" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata { name = "traefik-letsencrypt-pv" }
+  spec {
+    capacity           = { storage = "1Gi" }
+    access_modes       = ["ReadWriteOnce"]
+    storage_class_name = "microk8s-hostpath"
+    persistent_volume_source {
+      host_path { path = "/mnt/traefik_letsencrypt" }
+    }
+  }
+}
+
+resource "kubernetes_persistent_volume_claim" "traefik_pvc" {
+  depends_on = [ null_resource.wait_for_api ]
+  metadata {
+    name      = "traefik-letsencrypt-pvc"
+    namespace = "kube-system"
+  }
+  spec {
+    access_modes       = ["ReadWriteOnce"]
+    storage_class_name = "microk8s-hostpath"
+    resources { requests = { storage = "1Gi" } }
+    volume_name        = kubernetes_persistent_volume.traefik_pv.metadata[0].name
+  }
+}
+
+################################################################################
+# 5. Deployment — hostNetwork + mount ACME PVC
+################################################################################
+resource "kubernetes_deployment" "traefik" {
+  depends_on = [
+    kubernetes_cluster_role_binding.traefik_sa_to_core_role,
+    null_resource.wait_for_api,
+  ]
+  metadata {
+    name      = "traefik"
+    namespace = "kube-system"
+    labels    = { app = "traefik" }
+  }
+  spec {
+    replicas = 1
+    selector { match_labels = { app = "traefik" } }
+    template {
+      metadata { labels = { app = "traefik" } }
+      spec {
+        service_account_name = kubernetes_service_account.traefik_sa.metadata[0].name
+        host_network         = true
+        dns_policy           = "ClusterFirstWithHostNet"
+        toleration {
+          key      = "no-psautoinfra"
+          operator = "Exists"
+          effect   = "NoSchedule"
+        }
+        volume {
+          name = "letsencrypt"
+          persistent_volume_claim {
+            claim_name = kubernetes_persistent_volume_claim.traefik_pvc.metadata[0].name
+          }
+        }
+        volume {
+          name = "config"
+          config_map { name = kubernetes_config_map.traefik_cfg.metadata[0].name }
+        }
+        init_container {
+          name    = "init-letsencrypt"
+          image   = "busybox"
+          command = ["/bin/sh","-c"]
+          args    = ["mkdir -p /letsencrypt && touch /letsencrypt/acme.json && chmod 600 /letsencrypt/acme.json"]
+          volume_mount {
+            name       = "letsencrypt"
+            mount_path = "/letsencrypt"
+          }
+        }
+        container {
+          name  = "traefik"
+          image = "traefik:v3.3"
+          args  = ["--configFile=/etc/traefik/traefik.yaml"]
+          port {
+            name           = "http"
+            container_port = 80
+          }
+          port {
+            name           = "https"
+            container_port = 443
+          }
+          volume_mount {
+            name       = "letsencrypt"
+            mount_path = "/letsencrypt"
+          }
+          volume_mount {
+            name       = "config"
+            mount_path = "/etc/traefik"
+          }
+        }
+      }
+    }
+  }
+}
+
+################################################################################
+# 6. ClusterIP Service — expose 80 & 443
+################################################################################
+resource "kubernetes_service" "traefik" {
+  depends_on = [
+    kubernetes_deployment.traefik,
+    null_resource.wait_for_api,
+  ]
+  metadata {
+    name      = "traefik"
+    namespace = "kube-system"
+    labels    = { app = "traefik" }
+  }
+  spec {
+    selector = { app = "traefik" }
+    port {
+      name        = "http"
+      port        = 80
+      target_port = 80
+      protocol    = "TCP"
+    }
+    port {
+      name        = "https"
+      port        = 443
+      target_port = 443
+      protocol    = "TCP"
+    }
+    type = "ClusterIP"
+  }
+}
+
+################################################################################
+# 7. Rocket.Chat IngressRoutes (HTTP & HTTPS)
+################################################################################
+resource "local_file" "rocketchat_ingress_http_yaml" {
+  filename = "${path.module}/rocketchat-ingress-http.yaml"
+  content  = <<-YAML
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: rocketchat-ingress-http
+  namespace: psautoinfra
+spec:
+  entryPoints:
+    - web
+  routes:
+    - match: Host("${var.domain}")
+      kind: Rule
+      middlewares:
+        - name: redirect-to-https
+      services:
+        - name: psautoinframk8s-rocketchat
+          port: 80
+YAML
+}
+
+resource "null_resource" "apply_rocketchat_ingress_http" {
+  depends_on = [
+    kubernetes_deployment.traefik,
+    null_resource.wait_for_api,
+    null_resource.apply_redirect_to_https,
+  ]
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=\"${path.root}/microk8s.config\" apply -f ${local_file.rocketchat_ingress_http_yaml.filename}"
+  }
+  triggers = { always = timestamp() }
+}
+
+resource "local_file" "rocketchat_ingress_https_yaml" {
+  filename = "${path.module}/rocketchat-ingress-https.yaml"
+  content  = <<-YAML
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: rocketchat-ingress-https
+  namespace: psautoinfra
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: Host("${var.domain}")
+      kind: Rule
+      services:
+        - name: psautoinframk8s-rocketchat
+          port: 80
+  tls:
+    certResolver: letsencrypt
+YAML
+}
+
+resource "null_resource" "apply_rocketchat_ingress_https" {
+  depends_on = [
+    kubernetes_deployment.traefik,
+    null_resource.wait_for_api,
+  ]
+  provisioner "local-exec" {
+    command = "kubectl --kubeconfig=\"${path.root}/microk8s.config\" apply -f ${local_file.rocketchat_ingress_https_yaml.filename}"
+  }
+  triggers = { always = timestamp() }
+}

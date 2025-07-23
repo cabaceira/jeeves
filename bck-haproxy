@@ -1,0 +1,213 @@
+################################################################################
+# HAProxy + Let’s Encrypt – controller node
+################################################################################
+
+locals {
+  haproxy_cfg = <<-EOF
+global
+    log stdout format raw local0
+    maxconn 2000
+    daemon
+
+defaults
+    mode http
+    log global
+    option httplog
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+
+# ────────────────────────── FRONTENDS ──────────────────────────
+frontend http_in
+    bind *:80
+    acl host_rocket hdr(host) -i ${var.domain}
+    redirect scheme https code 301 if host_rocket
+
+frontend https_in
+    bind *:443 ssl crt /etc/letsencrypt/live/${var.domain}/haproxy.pem
+    acl host_rocket hdr(host) -i ${var.domain}
+    use_backend traefik_backend if host_rocket
+
+# ────────────────────────── BACKEND ────────────────────────────
+backend traefik_backend
+    balance roundrobin
+    server traefik 127.0.0.1:30080 check
+EOF
+}
+
+###############################################################################
+# 1) Install HAProxy
+###############################################################################
+resource "null_resource" "haproxy_pkg" {
+  connection {
+    host        = var.controller_ip
+    user        = "ubuntu"
+    private_key = file(var.ssh_key_path)
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo apt-get update -y",
+      "sudo apt-get install -y haproxy",
+    ]
+  }
+}
+
+###############################################################################
+# 2) Install Certbot via snap
+###############################################################################
+resource "null_resource" "certbot_pkg" {
+  depends_on = [null_resource.haproxy_pkg]
+
+  connection {
+    host        = var.controller_ip
+    user        = "ubuntu"
+    private_key = file(var.ssh_key_path)
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo apt-get update -y",
+      "sudo apt-get install -y snapd",
+      "sudo snap install --classic certbot || true",
+      "sudo ln -sf /snap/bin/certbot /usr/local/bin/certbot",
+    ]
+  }
+}
+
+###############################################################################
+# 3) Deploy-hook for auto-reload on renew
+###############################################################################
+resource "null_resource" "deploy_hook" {
+  depends_on = [null_resource.certbot_pkg]
+
+  connection {
+    host        = var.controller_ip
+    user        = "ubuntu"
+    private_key = file(var.ssh_key_path)
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo mkdir -p /etc/letsencrypt/renewal-hooks/deploy",
+      <<-EOT
+sudo bash -c 'cat > /etc/letsencrypt/renewal-hooks/deploy/reload-haproxy.sh << "EOF"
+#!/usr/bin/env bash
+set -euo pipefail
+cat /etc/letsencrypt/live/${var.domain}/fullchain.pem \\
+    /etc/letsencrypt/live/${var.domain}/privkey.pem \\
+  > /etc/letsencrypt/live/${var.domain}/haproxy.pem
+systemctl reload haproxy
+EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-haproxy.sh'
+EOT
+    ]
+  }
+}
+
+###############################################################################
+# 4) Obtain or renew certificate
+###############################################################################
+resource "null_resource" "certbot_issue" {
+  depends_on = [null_resource.deploy_hook]
+
+  triggers = {
+    domain = var.domain
+    email  = var.cert_email
+  }
+
+  connection {
+    host        = var.controller_ip
+    user        = "ubuntu"
+    private_key = file(var.ssh_key_path)
+  }
+
+  provisioner "remote-exec" {
+    inline = [
+      "sudo systemctl stop haproxy || true",
+        # obtain/renew cert **and** fire our deploy-hook immediately
+        <<-EOF
+  sudo bash -c 'certbot certonly \
+    --non-interactive \
+    --agree-tos \
+    --keep-until-expiring \
+    --email ${var.cert_email} \
+    --standalone \
+    --deploy-hook "/etc/letsencrypt/renewal-hooks/deploy/reload-haproxy.sh" \
+    -d ${var.domain} || true'
+  EOF
+    ]
+  }
+}
+
+###############################################################################
+# 5) Render HAProxy config locally
+###############################################################################
+resource "local_file" "haproxy_cfg" {
+  content  = local.haproxy_cfg
+  filename = "${path.module}/haproxy.cfg"
+}
+
+###############################################################################
+# 6) Deploy config + bootstrap & restart HAProxy with full checks
+###############################################################################
+resource "null_resource" "haproxy_deploy" {
+  depends_on = [
+    null_resource.haproxy_pkg,
+    null_resource.certbot_issue,
+  ]
+
+  triggers = {
+    cfg_sha = sha256(local_file.haproxy_cfg.content)
+  }
+
+  connection {
+    host        = var.controller_ip
+    user        = "ubuntu"
+    private_key = file(var.ssh_key_path)
+  }
+
+  # copy the new config over
+  provisioner "file" {
+    source      = local_file.haproxy_cfg.filename
+    destination = "/tmp/haproxy.cfg"
+  }
+
+  # remote steps: bootstrap cert, syntax check, start
+  provisioner "remote-exec" {
+    inline = [
+      # 6.1) Bootstrap a fallback cert if none exists
+      <<-EOT
+sudo bash -c 'CERT_DIR="/etc/letsencrypt/live/${var.domain}"
+if [ ! -f "$CERT_DIR/haproxy.pem" ]; then
+  mkdir -p "$CERT_DIR"
+  openssl req -x509 -nodes -newkey rsa:2048 -days 1 \
+    -subj "/CN=${var.domain}" \
+    -addext "subjectAltName=DNS:${var.domain}" \
+    -keyout "$CERT_DIR/haproxy.pem" \
+    -out    "$CERT_DIR/haproxy.pem"
+fi'
+EOT
+      ,
+      # 6.2) Move in the new config
+      "sudo mv /tmp/haproxy.cfg /etc/haproxy/haproxy.cfg",
+      # 6.3) Full syntax check
+      "echo '→ Checking haproxy config…' && sudo haproxy -c -f /etc/haproxy/haproxy.cfg",
+      # 6.4) Enable on boot
+      "sudo systemctl enable haproxy",
+      # 6.5) Restart with error dump on failure
+      <<-EOT
+echo '→ Restarting haproxy…'
+if sudo systemctl restart haproxy; then
+  echo "✔ haproxy started successfully"
+else
+  echo "‼ haproxy failed to start. Status follows:"
+  sudo systemctl status haproxy --no-pager
+  echo "‼ Last 100 log lines from haproxy:"
+  sudo journalctl -u haproxy -n100 --no-pager | sed 's/^/LOG: /'
+  exit 1
+fi
+EOT
+    ]
+  }
+}
