@@ -93,7 +93,20 @@ Each pipeline subclasses `Pipeline` and implements `run()`—the ordered steps f
   - Runs `terraform destroy`.  
   - Terminates controller & worker instances.  
   - Cleans up security groups with ENI-detachment retries and rule revocations.
+<<<<<<< HEAD
 
+All destroy scripts are **idempotent**: they check for resource existence, ignore “not found” errors, and retry or skip gracefully.
+
+---
+
+## 🛠️ Bootstrap Scripts
+=======
+>>>>>>> a149869 (updated readme)
+
+All scripts under `scripts/` use the same pattern:
+
+<<<<<<< HEAD
+=======
 All destroy scripts are **idempotent**: they check for resource existence, ignore “not found” errors, and retry or skip gracefully.
 
 ---
@@ -102,6 +115,7 @@ All destroy scripts are **idempotent**: they check for resource existence, ignor
 
 All scripts under `scripts/` use the same pattern:
 
+>>>>>>> a149869 (updated readme)
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -117,7 +131,11 @@ err()   { echo "[ERROR]" "$@" >&2; exit 1; }
   * Installs MongoDB, configures a single-node replica set, and sets up admin credentials.
 * **`rocketchat_bootstrap.sh`**
 
+<<<<<<< HEAD
   * Installs MicroK8s, joins worker to controller, enables DNS, storage, dashboard, etc.
+=======
+  * Installs Docker, pulls Rocket.Chat images, and runs `docker-compose up -d`.
+>>>>>>> a149869 (updated readme)
 * **`deploy_rocketchat_helm.sh`**
 
   * Adds the Rocket.Chat Helm repo, configures values, and runs `helm upgrade --install`.
@@ -137,8 +155,12 @@ err()   { echo "[ERROR]" "$@" >&2; exit 1; }
    * Support Multi-AZ controllers behind an NLB, add worker autoscaling groups.
 4. **Observability**
 
+<<<<<<< HEAD
    * Integrate Prometheus/Graphana Rocket.Chat metrics, CloudWatch Logs, default Prometheus metrics (Traefik & K8s), and alerting.
    * 
+=======
+   * Integrate Rocket.Chat Prometheus metrics (Traefik & K8s), CloudWatch Logs and alerting.
+>>>>>>> a149869 (updated readme)
 5. **Automated Testing**
 
    * Write unit tests for pipelines, stub AWS calls with `moto`, add end-to-end integration tests.

@@ -1,5 +1,6 @@
 # Jeeves
 
+![](jeeves.png)
 Jeeves is a Python-based provisioning tool for deploying and managing AWS-based Rocket.Chat environments. It is designed with a modular pipeline architecture, making it extensible for different deployment targets (e.g., Docker, Kubernetes + Helm).
 
 ## Project Structure
