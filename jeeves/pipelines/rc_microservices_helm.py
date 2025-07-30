@@ -256,6 +256,25 @@ class K8sDeploymentHelm(Pipeline):
             "worker":    {"id":worker_i.id, "public":worker_pub, "private":worker_pri},
         }, indent=2))
 
+        ssh_key_path = pathlib.Path(env["SSH_KEY_PATH"]).expanduser()
+
+        # ———————————
+        # 5.9) Ensure SSH key has correct permissions
+        # ———————————
+        actual_mode = oct(ssh_key_path.stat().st_mode)[-3:]
+        if actual_mode != "600":
+            print(f"⚠️ SSH key {ssh_key_path} has permissions {actual_mode}, fixing to 600…")
+            try:
+                ssh_key_path.chmod(0o600)
+                print(f"✅ Permissions fixed on {ssh_key_path}")
+            except PermissionError:
+                print(f"❌ Cannot change permissions on {ssh_key_path}. Retrying with sudo…")
+                subprocess.run(["sudo", "chmod", "600", str(ssh_key_path)], check=True)
+                print("✅ Permissions fixed using sudo.")
+        else:
+            print(f"✅ SSH key {ssh_key_path} already has correct permissions (600).")
+
+
         # ———————————
         # 6) Copy SSH key into Terraform dir
         # ———————————
