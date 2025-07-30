@@ -1,0 +1,19 @@
+git clone --recurse-submodules git@github.com:cabaceira/jeeves.git
+cd jeeves
+Execute - initPython.sh script to create a venv and install requirements.
+
+Make sure your key has appropriate permissions : 
+
+    chmod 600 ps-lab.pem in jeeves root and ps-auto-infra
+    
+create a .env file and provide details (cp .env.sample .env)
+
+Export your AWS credentials to the shell or configure your local profile.
+------------------
+export AWS_ACCESS_KEY_ID="KEY-ID-HERE"
+export AWS_SECRET_ACCESS_KEY="ACCESS-KEY-HERE"
+export AWS_SESSION_TOKEN="TOKEN-HERE"
+
+Run jeeves pipelines list
+    jeeves pipelines run <pipeline>
+    jeeves describe pipeline <pipeline> for pipeline documentation
