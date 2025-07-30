@@ -8,6 +8,8 @@ Make sure your key has appropriate permissions :
     
 create a .env file and provide details (cp .env.sample .env)
 
+Use only ubuntu 22.04, mongo will fail if ubuntu 24.04 is selected
+
 Export your AWS credentials to the shell or configure your local profile.
 ------------------
 export AWS_ACCESS_KEY_ID="KEY-ID-HERE"
