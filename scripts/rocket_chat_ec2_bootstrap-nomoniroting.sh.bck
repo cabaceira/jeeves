@@ -95,6 +95,7 @@ create_network() {
 ############################
 write_compose() {
   info "Writing docker-compose.yml"
+  # ensure ACME file exists & locked
   touch acme.json && chmod 600 acme.json
 
   cat > docker-compose.yml <<EOF
@@ -106,10 +107,6 @@ networks:
 
 volumes:
   traefik: {}
-  prometheus_data:
-    driver: local
-  grafana_data:
-    driver: local
 
 services:
   traefik:
@@ -124,12 +121,16 @@ services:
       - ./acme.json:/letsencrypt/acme.json:rw
       - /var/run/docker.sock:/var/run/docker.sock:ro
     command:
+      # Entrypoints
       - --entrypoints.web.address=:80
       - --entrypoints.websecure.address=:443
+      # HTTP→HTTPS redirect
       - --entrypoints.web.http.redirections.entryPoint.to=websecure
       - --entrypoints.web.http.redirections.entryPoint.scheme=https
+      # Docker provider
       - --providers.docker=true
       - --providers.docker.exposedbydefault=false
+      # ACME (HTTP-01 challenge)
       - --certificatesresolvers.le.acme.httpchallenge=true
       - --certificatesresolvers.le.acme.httpchallenge.entryPoint=web
       - --certificatesresolvers.le.acme.email=${LETSENCRYPT_EMAIL}
@@ -155,71 +156,30 @@ services:
       OVERWRITE_SETTING_Accounts_TwoFactorAuthentication_Enabled: "false"
       OVERWRITE_SETTING_Allow_Marketing_Emails: "false"
     labels:
+      # tell Traefik to watch this service
       traefik.enable: "true"
+
+      # 1) HTTP router: catch DOMAIN on :80, redirect to HTTPS
       traefik.http.routers.http-redirect.rule: "Host(\\"${DOMAIN}\\")"
       traefik.http.routers.http-redirect.entrypoints: "web"
       traefik.http.routers.http-redirect.middlewares: "redirect-to-https"
+
+      # middleware definition
       traefik.http.middlewares.redirect-to-https.redirectscheme.scheme: "https"
+
+      # 2) HTTPS router: catch DOMAIN on :443, secure it, route to service
       traefik.http.routers.rc-secure.rule: "Host(\\"${DOMAIN}\\")"
       traefik.http.routers.rc-secure.entrypoints: "websecure"
       traefik.http.routers.rc-secure.tls: "true"
       traefik.http.routers.rc-secure.tls.certresolver: "le"
       traefik.http.routers.rc-secure.service: "rc-svc"
+
+      # service → port 3000
       traefik.http.services.rc-svc.loadbalancer.server.port: "3000"
-
-  prometheus:
-    image: prom/prometheus:latest
-    restart: always
-    networks:
-      - web
-    volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ./prometheus/rules:/etc/prometheus/rules:ro
-      - prometheus_data:/prometheus
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-    expose:
-      - "9090"
-    labels:
-      traefik.enable: "true"
-      traefik.http.routers.prom.rule: "Host(\\"${DOMAIN}\\") && PathPrefix(`/prometheus`)"
-      traefik.http.routers.prom.entrypoints: "websecure"
-      traefik.http.routers.prom.tls: "true"
-      traefik.http.routers.prom.tls.certresolver: "le"
-      traefik.http.services.prom.loadbalancer.server.port: "9090"
-    depends_on:
-      - rocketchat
-
-  grafana:
-    image: grafana/grafana:latest
-    restart: always
-    networks:
-      - web
-    environment:
-      GF_SECURITY_ADMIN_PASSWORD: "admin"
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
-    expose:
-      - "3000"
-    labels:
-      traefik.enable: "true"
-      traefik.http.routers.graf.rule: "Host(\\"${DOMAIN}\\") && PathPrefix(`/grafana`)"
-      traefik.http.routers.graf.entrypoints: "websecure"
-      traefik.http.routers.graf.tls: "true"
-      traefik.http.routers.graf.tls.certresolver: "le"
-      traefik.http.services.graf.loadbalancer.server.port: "3000"
-    depends_on:
-      - prometheus
 EOF
 
   ok "docker-compose.yml written"
 }
-
 
 
 ############################

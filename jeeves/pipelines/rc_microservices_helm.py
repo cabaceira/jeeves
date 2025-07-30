@@ -339,69 +339,202 @@ class K8sDeploymentHelm(Pipeline):
         ], check=True)
         print("✔ Public key re-installed on worker (pre-apply)")
 
-        tf_dir = str(tf_dir)
-        tfvars_arg = f"-var-file={tfvars_path.name}"
+        # ———————————
+        # 8.1) Establish SSH tunnel for Kubernetes API
+        # ———————————
+        # Configuration
+        ssh_key_path = ssh_key_path
+        controller_pub = ctrl_pub
+        local_port = 16443
 
-        # ─────────────────────────────────────────────────────── Phase 1 ───────────────────────────────────────────────────────
-        print("🚧 Phase 1: spinning up EC2 instances and installing MicroK8s…")
-        subprocess.run(["terraform","init"],   cwd=tf_dir, check=True)
-        subprocess.run([
-            "terraform","apply","-auto-approve",
-            tfvars_arg,
-            # target only the controller module's null_resource so we get MicroK8s installed
-            "-target=module.controller.null_resource.k8s_controller",
-        ], cwd=tf_dir, check=True)
+        def tunnel_exists(port):
+            """Check if any process is listening on the given local port."""
+            result = subprocess.run(
+                ["lsof", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
+            return result.returncode == 0
 
-        # ─────────────────────────────────────────────────────── Phase 2 Prep ───────────────────────────────────────────────────────
-        print("🔌 Opening SSH tunnel to controller for Kubernetes API…")
-        # kill any old tunnel
-        subprocess.run(
-            ["pkill","-f",f"ssh .* -L 16443:127.0.0.1:16443 .*{ctrl_pub}"],
-            check=False
-        )
-        # fire up a new one
-        subprocess.Popen([
-            "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-i", str(ssh_key_path),
-            "-fN",
-            "-L", "16443:127.0.0.1:16443",
-            f"ubuntu@{ctrl_pub}",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        def kill_existing_tunnel(port):
+            """Kill any existing listener on the given port (use with caution)."""
+            subprocess.run(
+                f"lsof -tiTCP:{port} | xargs -r kill -9",
+                shell=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+        print(f"🔌 Preparing to start SSH tunnel for K8s API (localhost:{local_port})…")
+        if tunnel_exists(local_port):
+            print(f"⚠️  Tunnel already exists on localhost:{local_port}, skipping setup.")
+        else:
+            print(f"🔧 No tunnel found. Cleaning up stale listeners and opening new SSH tunnel to {controller_pub}…")
+            kill_existing_tunnel(local_port)  # optional: if stale tunnels might exist
+            try:
+                subprocess.run([
+                    "ssh",
+                    "-o", "StrictHostKeyChecking=no",
+                    "-i", ssh_key_path,
+                    "-fN",  # go to background, no remote command
+                    "-L", f"{local_port}:127.0.0.1:{local_port}",
+                    f"ubuntu@{controller_pub}"
+                ], check=True)
+                print(f"✅ SSH tunnel established on localhost:{local_port} → {controller_pub}")
+            except subprocess.CalledProcessError:
+                print("❌ Failed to establish SSH tunnel. Continuing anyway — controller may not be up yet.")
+            # Give some time before anything depends on it
+            time.sleep(5)
 
-        # wait for the tunnel to bind
-        for i in range(24):
-            if subprocess.run(["nc","-z","127.0.0.1","16443"]).returncode == 0:
-                print("✔ SSH tunnel is up (127.0.0.1:16443 → controller)")
+         # 11) Update Route53 A record
+            print("🔑 Updating Route 53 A record…")
+            domain = settings.domain.strip()
+            if "." not in domain:
+                raise RuntimeError(f"Invalid DOMAIN '{domain}'")
+            parent = ".".join(domain.split(".")[1:]) + "."
+            r53 = sess.client("route53")
+            hz = r53.list_hosted_zones_by_name(DNSName=parent, MaxItems="1")["HostedZones"]
+            if not hz or hz[0]["Name"] != parent:
+                raise RuntimeError(f"No hosted zone for '{parent}'")
+            zone_id = hz[0]["Id"].split("/")[-1]
+            rc = list(ec2.instances.filter(
+                Filters=[{"Name":"tag:Name","Values":["jeeves-k8s-controller"]},
+                         {"Name":"instance-state-name","Values":["running"]}]
+            ))
+            if not rc:
+                raise RuntimeError("Controller instance not found")
+            rec = {
+                "Comment": "Upsert by Jeeves rc_microservices_helm",
+                "Changes": [{
+                    "Action":"UPSERT",
+                    "ResourceRecordSet":{
+                        "Name": domain,
+                        "Type":"A",
+                        "TTL":60,
+                        "ResourceRecords":[{"Value": rc[0].public_ip_address}],
+                    }
+                }]
+            }
+            resp = r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch=rec)
+            info = resp.get("ChangeInfo",{})
+            print(f"Route53 change: ID={info.get('Id')} Status={info.get('Status')}")
+
+        # ———————————
+        # 9) Run Terraform (infra + k8s install, then full apply)
+        # ———————————
+        os.environ["KUBE_INSECURE_SKIP_TLS_VERIFY"] = "true"
+        print("📦 Running Terraform (infra stage only)...")
+        subprocess.run(["terraform", "init"], cwd=str(tf_dir), check=True)
+
+        # Stage 1: Infra + MicroK8s installation (no K8s resources yet)
+        infra_targets = [
+            "aws_instance.jeeves-mongo-master",
+            "aws_instance.jeeves-k8s-controller",
+            "aws_instance.jeeves-k8s-worker",
+            "module.rocketchat.null_resource.check_existing_pvs",
+            "null_resource.microk8s_install",  # <—— this must install MicroK8s!
+            # anything else that sets up the controller
+        ]
+        infra_cmd = [
+            "terraform", "apply", "-auto-approve", f"-var-file={tfvars_path.name}"
+        ] + sum([["-target", t] for t in infra_targets], [])
+
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                subprocess.run(infra_cmd, cwd=str(tf_dir), check=True)
+                print("✅ Infra-only Terraform apply succeeded.")
                 break
-            print(f"⏳ Waiting for API tunnel ({i+1}/24)…")
+            except subprocess.CalledProcessError:
+                if attempt == max_attempts:
+                    print("❌ Infra apply failed after retries.")
+                    raise
+                print(f"⚠️ Infra apply failed on attempt {attempt}, retrying in 20 seconds…")
+                time.sleep(20)
+
+        # 🕒 Wait for MicroK8s install to complete on controller
+        print("🕒 Giving MicroK8s 10s to settle before fetching kubeconfig…")
+        time.sleep(10)
+
+        # 🧾 Fetch MicroK8s kubeconfig from controller
+        print("📥 Fetching MicroK8s kubeconfig from controller...")
+        remote_cmd = "microk8s config"
+        result = subprocess.run([
+            "ssh", "-o", "StrictHostKeyChecking=no", "-i", str(ssh_key_path),
+            f"ubuntu@{ctrl_pub}", remote_cmd
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        if result.returncode != 0:
+            raise RuntimeError(f"❌ Failed to fetch kubeconfig:\n{result.stderr}")
+
+        kubeconfig_path = tf_dir / "microk8s.config"
+        with open(kubeconfig_path, "w") as f:
+            f.write(result.stdout)
+        print(f"✅ Wrote kubeconfig to {kubeconfig_path}")
+        tfvars["kube_config_path"] = str(kubeconfig_path.resolve())
+
+        # ----------------------------------------
+        # PATCH kubeconfig to use localhost for SSH tunnel
+        # ----------------------------------------
+        kubeconfig_path = tf_dir / "microk8s.config"
+        controller_private_ip = ctrl_pri  # already available earlier
+
+        print("🩹 Patching microk8s.config to use localhost (for SSH tunnel)...")
+        with open(kubeconfig_path, "r+") as f:
+            content = f.read()
+            before_patch = f"https://{controller_private_ip}:16443"
+            after_patch = "https://127.0.0.1:16443"
+            if before_patch in content:
+                print(f"🔁 Replacing '{before_patch}' → '{after_patch}'")
+                content = content.replace(before_patch, after_patch)
+                f.seek(0)
+                f.write(content)
+                f.truncate()
+                print("✅ microk8s.config patched for local access")
+            else:
+                print("✅ No need to patch, already pointing to localhost")
+
+
+
+        # Run just the MicroK8s wait resource
+        subprocess.run([
+            "terraform", "apply", "-auto-approve",
+            "-target=null_resource.wait_for_microk8s_ready",
+            f"-var-file={tfvars_path.name}"
+        ], cwd=str(tf_dir), check=True)
+
+        # ✅ Double-check API is actually ready using kubectl (from kubeconfig)
+        print("🩺 Confirming kube-apiserver is truly accepting requests...")
+        for i in range(30):
+            result = subprocess.run([
+                "kubectl",
+                "--kubeconfig", tfvars["kube_config_path"],
+                "get", "namespace", "kube-system"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode == 0:
+                print("✅ kube-apiserver is responsive.")
+                break
+            print(f"⌛ Attempt {i+1}/30: kube-apiserver still warming up...")
             time.sleep(5)
         else:
-            raise RuntimeError("Timed out waiting for SSH tunnel to controller:16443")
-
-        # ─────────────────────────────────────────────────────── Phase 2 ───────────────────────────────────────────────────────
-        print("🚀 Phase 2: provisioning Kubernetes resources…")
-        subprocess.run([
-            "terraform","apply","-auto-approve", tfvars_arg
-        ], cwd=tf_dir, check=True)
-
-        print("✅ All done!")
+            raise RuntimeError("❌ kube-apiserver did not become ready in time")
 
 
+        # Stage 2: Full apply including Kubernetes resources, with retry on failure
+        print("🚀 Running full Terraform apply (K8s stage, with retry)...")
+        apply_cmd = ["terraform", "apply", "-auto-approve", f"-var-file={tfvars_path.name}"]
 
-
-        # ———————————
-        # 9) Run Terraform
-        # ———————————
-        for cmd in (
-            ["terraform", "init"],
-            ["terraform", "apply", "-auto-approve", f"-var-file={tfvars_path.name}"],
-        ):
-            print(f"Running {' '.join(cmd)} in {tf_dir}")
-            subprocess.run(cmd, cwd=str(tf_dir), check=True)
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            try:
+                subprocess.run(apply_cmd, cwd=str(tf_dir), check=True)
+                print("✅ Full Terraform apply succeeded.")
+                break
+            except subprocess.CalledProcessError as e:
+                if attempt == max_attempts:
+                    print("❌ Final Terraform apply attempt failed.")
+                    raise
+                print(f"⚠️ Terraform apply failed on attempt {attempt}, retrying in 20 seconds…")
+                time.sleep(20)
 
         # ———————————
         # 10) Post-apply: re-ensure SSH & re-install key
@@ -416,38 +549,7 @@ class K8sDeploymentHelm(Pipeline):
         ], check=True)
         print("✔ Public key re-installed on worker (post-apply)")
 
-        # 11) Update Route53 A record
-        print("🔑 Updating Route 53 A record…")
-        domain = settings.domain.strip()
-        if "." not in domain:
-            raise RuntimeError(f"Invalid DOMAIN '{domain}'")
-        parent = ".".join(domain.split(".")[1:]) + "."
-        r53 = sess.client("route53")
-        hz = r53.list_hosted_zones_by_name(DNSName=parent, MaxItems="1")["HostedZones"]
-        if not hz or hz[0]["Name"] != parent:
-            raise RuntimeError(f"No hosted zone for '{parent}'")
-        zone_id = hz[0]["Id"].split("/")[-1]
-        rc = list(ec2.instances.filter(
-            Filters=[{"Name":"tag:Name","Values":["jeeves-k8s-controller"]},
-                     {"Name":"instance-state-name","Values":["running"]}]
-        ))
-        if not rc:
-            raise RuntimeError("Controller instance not found")
-        rec = {
-            "Comment": "Upsert by Jeeves rc_microservices_helm",
-            "Changes": [{
-                "Action":"UPSERT",
-                "ResourceRecordSet":{
-                    "Name": domain,
-                    "Type":"A",
-                    "TTL":60,
-                    "ResourceRecords":[{"Value": rc[0].public_ip_address}],
-                }
-            }]
-        }
-        resp = r53.change_resource_record_sets(HostedZoneId=zone_id, ChangeBatch=rec)
-        info = resp.get("ChangeInfo",{})
-        print(f"Route53 change: ID={info.get('Id')} Status={info.get('Status')}")
+
 
 
         print("✅ ps-auto-infra Terraform deployment complete!")

@@ -8,32 +8,9 @@ locals {
   ]
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 1b. Wait for the API server to recover
-# ──────────────────────────────────────────────────────────────────────────────
-resource "null_resource" "wait_for_k8s_api" {
-  depends_on = [ null_resource.wait_for_traefik_crds_established ]
-
-  provisioner "local-exec" {
-    interpreter = ["bash", "-c"]
-    command = <<-EOT
-      for i in $(seq 1 20); do
-        if kubectl --kubeconfig="${path.root}/microk8s.config" get --raw="/healthz" 2>/dev/null | grep -q ok; then
-          echo "✅ kube-apiserver healthy"
-          exit 0
-        fi
-        echo "⏳ Waiting for kube-apiserver… ($i/20)"
-        sleep 5
-      done
-      echo "❌ kube-apiserver never became healthy"
-      exit 1
-    EOT
-  }
-}
-
 resource "null_resource" "install_crds" {
   triggers = { always = timestamp() }
-  depends_on = [null_resource.wait_for_k8s_api]
+
   provisioner "local-exec" {
     command = <<-EOT
       for url in ${join(" ", local.crd_files)}; do
@@ -65,11 +42,34 @@ resource "null_resource" "wait_for_traefik_crds_established" {
   }
 }
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 1b. Wait for the API server to recover
+# ──────────────────────────────────────────────────────────────────────────────
+resource "null_resource" "wait_for_api" {
+  depends_on = [ null_resource.wait_for_traefik_crds_established ]
+
+  provisioner "local-exec" {
+    interpreter = ["bash", "-c"]
+    command = <<-EOT
+      for i in $(seq 1 20); do
+        if kubectl --kubeconfig="${path.root}/microk8s.config" get --raw="/healthz" 2>/dev/null | grep -q ok; then
+          echo "✅ kube-apiserver healthy"
+          exit 0
+        fi
+        echo "⏳ Waiting for kube-apiserver… ($i/20)"
+        sleep 5
+      done
+      echo "❌ kube-apiserver never became healthy"
+      exit 1
+    EOT
+  }
+}
+
 ################################################################################
 # 2. ServiceAccount & RBAC
 ################################################################################
 resource "kubernetes_service_account" "traefik_sa" {
-  depends_on = [null_resource.wait_for_k8s_api]
+  depends_on = [ null_resource.wait_for_api ]
   metadata {
     name      = "traefik-ingress-controller"
     namespace = "kube-system"
@@ -77,7 +77,7 @@ resource "kubernetes_service_account" "traefik_sa" {
 }
 
 resource "kubernetes_cluster_role" "traefik_core" {
-  depends_on = [null_resource.wait_for_k8s_api]
+  depends_on = [ null_resource.wait_for_api ]
   metadata { name = "traefik-core-access" }
   rule {
     api_groups = [""]
@@ -97,7 +97,7 @@ resource "kubernetes_cluster_role" "traefik_core" {
 }
 
 resource "kubernetes_cluster_role_binding" "traefik_sa_to_upstream_role" {
-  depends_on = [null_resource.wait_for_k8s_api]
+  depends_on = [ null_resource.wait_for_api ]
   metadata { name = "traefik-ingress-controller-kubesystem" }
   role_ref {
     api_group = "rbac.authorization.k8s.io"
@@ -112,7 +112,7 @@ resource "kubernetes_cluster_role_binding" "traefik_sa_to_upstream_role" {
 }
 
 resource "kubernetes_cluster_role_binding" "traefik_sa_to_core_role" {
-  depends_on = [null_resource.wait_for_k8s_api]
+  depends_on = [ null_resource.wait_for_api ]
   metadata { name = "traefik-core-access-binding" }
   role_ref {
     api_group = "rbac.authorization.k8s.io"
@@ -130,7 +130,7 @@ resource "kubernetes_cluster_role_binding" "traefik_sa_to_core_role" {
 # 3. ConfigMap — entryPoints + ACME (no built-in redirect)
 ################################################################################
 resource "kubernetes_config_map" "traefik_cfg" {
-  depends_on = [null_resource.wait_for_k8s_api]
+  depends_on = [ null_resource.wait_for_api ]
   metadata {
     name      = "traefik-config"
     namespace = "kube-system"
@@ -178,9 +178,8 @@ YAML
 }
 
 resource "null_resource" "apply_redirect_to_https" {
-
   depends_on = [
-    null_resource.wait_for_k8s_api,
+    null_resource.wait_for_api,
     null_resource.wait_for_traefik_crds_established,
   ]
   provisioner "local-exec" {
@@ -193,7 +192,7 @@ resource "null_resource" "apply_redirect_to_https" {
 # 4. hostPath PV / PVC for ACME storage
 ################################################################################
 resource "kubernetes_persistent_volume" "traefik_pv" {
-  depends_on = [ null_resource.wait_for_k8s_api ]
+  depends_on = [ null_resource.wait_for_api ]
   metadata { name = "traefik-letsencrypt-pv" }
   spec {
     capacity           = { storage = "1Gi" }
@@ -206,7 +205,7 @@ resource "kubernetes_persistent_volume" "traefik_pv" {
 }
 
 resource "kubernetes_persistent_volume_claim" "traefik_pvc" {
-  depends_on = [ null_resource.wait_for_k8s_api ]
+  depends_on = [ null_resource.wait_for_api ]
   metadata {
     name      = "traefik-letsencrypt-pvc"
     namespace = "kube-system"
@@ -225,7 +224,7 @@ resource "kubernetes_persistent_volume_claim" "traefik_pvc" {
 resource "kubernetes_deployment" "traefik" {
   depends_on = [
     kubernetes_cluster_role_binding.traefik_sa_to_core_role,
-    null_resource.wait_for_k8s_api,
+    null_resource.wait_for_api,
   ]
   metadata {
     name      = "traefik"
@@ -298,7 +297,7 @@ resource "kubernetes_deployment" "traefik" {
 resource "kubernetes_service" "traefik" {
   depends_on = [
     kubernetes_deployment.traefik,
-    null_resource.wait_for_k8s_api,
+    null_resource.wait_for_api,
   ]
   metadata {
     name      = "traefik"
@@ -338,7 +337,7 @@ spec:
   entryPoints:
     - web
   routes:
-    - match: Host("${var.domain}")
+    - match: Host("${var.domain}") && PathPrefix("/")
       kind: Rule
       middlewares:
         - name: redirect-to-https
@@ -351,6 +350,7 @@ YAML
 resource "null_resource" "apply_rocketchat_ingress_http" {
   depends_on = [
     kubernetes_deployment.traefik,
+    null_resource.wait_for_api,
     null_resource.wait_for_traefik_crds_established,
   ]
   provisioner "local-exec" {
@@ -371,7 +371,7 @@ spec:
   entryPoints:
     - websecure
   routes:
-    - match: Host("${var.domain}")
+    - match: Host("${var.domain}") && PathPrefix("/")
       kind: Rule
       services:
         - name: psautoinframk8s-rocketchat
@@ -384,6 +384,7 @@ YAML
 resource "null_resource" "apply_rocketchat_ingress_https" {
   depends_on = [
     kubernetes_deployment.traefik,
+    null_resource.wait_for_api,
     null_resource.wait_for_traefik_crds_established,
   ]
   provisioner "local-exec" {
@@ -392,61 +393,3 @@ resource "null_resource" "apply_rocketchat_ingress_https" {
   triggers = { always = timestamp() }
 }
 
-################################################################################
-# 8. ACME HTTP-01 Challenge Route (needed for valid TLS certs)
-################################################################################
-
-# Dummy service (reuses Rocket.Chat selector just to route the challenge)
-resource "kubernetes_service" "noop_svc" {
-  depends_on = [null_resource.wait_for_k8s_api]
-  metadata {
-    name      = "noop-svc"
-    namespace = var.deployment_namespace
-  }
-  spec {
-    selector = {
-      app = "rocketchat"
-    }
-    port {
-      name        = "http"
-      port        = 80
-      target_port = 80
-    }
-  }
-}
-
-# IngressRoute to expose .well-known/acme-challenge
-resource "local_file" "acme_challenge_ingress" {
-  depends_on = [null_resource.wait_for_k8s_api]
-  filename = "${path.module}/acme-challenge.yaml"
-  content  = <<-YAML
-apiVersion: traefik.io/v1alpha1
-kind: IngressRoute
-metadata:
-  name: acme-challenge
-  namespace: ${var.deployment_namespace}
-spec:
-  entryPoints:
-    - web
-  routes:
-    - match: PathPrefix(\`/.well-known/acme-challenge/\`)
-      kind: Rule
-      services:
-        - name: noop-svc
-          port: 80
-  tls: {}
-YAML
-}
-
-resource "null_resource" "apply_acme_challenge_ingress" {
-  depends_on = [
-    kubernetes_service.noop_svc,
-    null_resource.wait_for_traefik_crds_established,
-  ]
-  provisioner "local-exec" {
-    command = "kubectl --kubeconfig=\"${path.root}/microk8s.config\" apply -f ${local_file.acme_challenge_ingress.filename}"
-  }
-  triggers = {
-    always = timestamp()
-  }
-}

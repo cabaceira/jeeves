@@ -10,6 +10,9 @@ _VERSION_CODENAME: dict[str, str] = {
     "16.04": "xenial",
 }
 
+# List of Ubuntu versions that are known to work with MongoDB
+_SUPPORTED_UBUNTU_VERSIONS = {"22.04", "20.04", "18.04"}
+
 def session() -> boto3.Session:
     """
     Create and return a boto3 Session using AWS credentials
@@ -19,7 +22,6 @@ def session() -> boto3.Session:
         aws_access_key_id=settings.aws_access_key_id,
         aws_secret_access_key=settings.aws_secret_access_key,
         aws_session_token=settings.aws_session_token,
-        # boto3 will also fall back to AWS_DEFAULT_REGION if this is None
         region_name=getattr(settings, "region_name", None),
     )
 
@@ -28,8 +30,7 @@ def latest_ubuntu_ami(ec2_client, os_version: str | None = None) -> str:
     """
     Retrieve the most recent Ubuntu AMI ID for the specified OS version.
 
-    Tries several name‐patterns (including codename mappings) to handle
-    variations in the official Ubuntu AMI naming scheme.
+    Falls back to 22.04 if an unsupported version like 24.04 is requested.
 
     Args:
         ec2_client: a boto3 EC2 client
@@ -45,20 +46,29 @@ def latest_ubuntu_ami(ec2_client, os_version: str | None = None) -> str:
     if os_version is None:
         os_version = settings.default_os_version
 
+    # Fallback for MongoDB compatibility
+    if os_version == "24.04":
+        print("⚠️  WARNING: Ubuntu 24.04 (noble) is not yet supported by MongoDB. Falling back to 22.04 (jammy).")
+        os_version = "22.04"
+
+    if os_version not in _SUPPORTED_UBUNTU_VERSIONS:
+        raise ValueError(
+            f"Ubuntu version '{os_version}' is not supported for MongoDB deployments. "
+            f"Supported versions: {', '.join(sorted(_SUPPORTED_UBUNTU_VERSIONS))}"
+        )
+
     canonical_owner = "099720109477"
-    # Build a list of name-patterns to try, most-specific first
-    patterns: list[str] = []
     codename = _VERSION_CODENAME.get(os_version)
+
+    # Build list of name-patterns to try
+    patterns: list[str] = []
     if codename:
         patterns.append(f"ubuntu/images/hvm-ssd/ubuntu-{os_version}-{codename}-*server-*")
         patterns.append(f"ubuntu/images/hvm-ssd/ubuntu-{codename}-{os_version}-*server-*")
-    # Generic version-first patterns
     patterns.append(f"ubuntu/images/hvm-ssd/ubuntu-{os_version}-*amd64-server-*")
     patterns.append(f"ubuntu/images/hvm-ssd/ubuntu-{os_version}-*server-*")
-    # Last-resort fuzzy match
     patterns.append(f"*ubuntu*{os_version}*server*")
 
-    # Common filters for all queries
     filters_common = [
         {"Name": "state",            "Values": ["available"]},
         {"Name": "architecture",     "Values": ["x86_64"]},
@@ -83,6 +93,5 @@ def latest_ubuntu_ami(ec2_client, os_version: str | None = None) -> str:
             f"Patterns tried: {tried}"
         )
 
-    # Sort by CreationDate (ISO8601) and return the newest
     images.sort(key=lambda img: img["CreationDate"])
     return images[-1]["ImageId"]
